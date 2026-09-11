@@ -1,87 +1,65 @@
 import numpy as np
 import torch
 from PIL import Image
-import torchvision.transforms as T
-from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from .easyocr_reader import get_reader, crop_by_keywords
 from .ultils import extract_fields, draw_boxes
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
 _model = None
-_tokenizer = None
+_processor = None
 _device = None
 
 
-def load_vlm_model(model_name="5CD-AI/Vintern-1B-v3_5", device=None):
-    global _model, _tokenizer, _device
-    if _model is None or _tokenizer is None:
-        _device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        _model = AutoModel.from_pretrained(model_name, trust_remote_code=True).eval().to(_device)
-        _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    return _model, _tokenizer, _device
+def load_vlm_model(model_name="Qwen/Qwen3-VL-8B-Instruct", device=None):
+    global _model, _processor, _device
+    if _model is None or _processor is None:
+        _device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        _model = Qwen3VLForConditionalGeneration.from_pretrained(model_name, dtype="auto", device_map="auto")
+        _processor = AutoProcessor.from_pretrained(model_name)
+    return _model, _processor, _device
 
 
-def _build_transform(input_size=448):
-    return T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    ])
-
-
-def _load_image(image, input_size=448):
-    if image is None:
-        raise ValueError("No image provided.")
-    if not isinstance(image, Image.Image):
-        image = Image.open(image)
-    transform = _build_transform(input_size)
-    return transform(image).unsqueeze(0)
-
-
-def process_image(image, user_request, model=None, tokenizer=None, device=None):
+def process_image(image, user_request, model=None, processor=None, device=None, max_new_tokens=256):
     """
-    Xử lý ảnh và chạy qua mô hình Vintern.
+    Xử lý ảnh và chạy qua mô hình Qwen3-VL.
     """
-    if model is None or tokenizer is None:
-        model, tokenizer, default_device = load_vlm_model()
+    if model is None or processor is None:
+        model, processor, default_device = load_vlm_model()
         device = device or default_device
-    elif device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = model.to(device)
-    model.eval()
-
-    # Load and normalize image
-    pixel_values = _load_image(image).to(device)
-
-    generation_config = {
-        "max_new_tokens": 256,
-        "do_sample": False,
-        "num_beams": 3,
-        "repetition_penalty": 2.0
-    }
 
     if not user_request or not user_request.strip():
         user_request = "Trích xuất toàn bộ thông tin trong ảnh và trả về dạng Markdown."
 
-    question = f"<image>\n{user_request}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": user_request},
+            ],
+        }
+    ]
+
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
 
     with torch.inference_mode():
-        response, _ = model.chat(
-            tokenizer,
-            pixel_values,
-            question,
-            generation_config,
-            history=None,
-            return_history=True
-        )
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
-    return response
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+
+    return output_text[0]
 
 
 def extract_patch(img, start, end, all_line_ys, show=False):
@@ -93,9 +71,9 @@ def extract_patch(img, start, end, all_line_ys, show=False):
     return patch
 
 
-def read_patch(img, *, user_request=None, model=None, tokenizer=None, device=None, show=False):
+def read_patch(img, *, user_request=None, model=None, processor=None, device=None, show=False):
     image = Image.fromarray(img)
-    text = process_image(image, user_request, model, tokenizer, device)
+    text = process_image(image, user_request, model, processor, device)
     return text
 
 
@@ -134,7 +112,7 @@ def get_second_info(img, debug=False):
 
             region_pil = Image.fromarray(region)
 
-            # OCR with Vintern
+            # OCR with Qwen3-VL
             ocr_text = process_image(
                 region_pil,
                 user_request="Chỉ trích xuất số trong vùng này.",

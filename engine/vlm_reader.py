@@ -15,7 +15,9 @@ def load_vlm_model(model_name="Qwen/Qwen3-VL-8B-Instruct", device=None):
     global _model, _processor, _device
     if _model is None or _processor is None:
         _device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        _model = Qwen3VLForConditionalGeneration.from_pretrained(model_name, dtype="auto", device_map="auto")
+        _model = Qwen3VLForConditionalGeneration.from_pretrained(
+            model_name, dtype="auto", device_map=(device or "auto")
+        )
         _processor = AutoProcessor.from_pretrained(model_name)
     return _model, _processor, _device
 
